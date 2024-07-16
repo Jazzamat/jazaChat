@@ -1,6 +1,9 @@
 use std::{io::{self, Read, Write}, net::TcpListener};
 
 
+fn main () -> io::Result<()> {
+    server()
+}
 
 fn server() -> io::Result<()>{
 
