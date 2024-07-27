@@ -1,3 +1,7 @@
+![image](https://github.com/user-attachments/assets/7c378716-6140-4909-9297-432bd7bc0dfe)
+
+A basic TCP chat implemented in rust. 
+
 To run the client, cd into the dir and 'cargo run'. You need rust to run cargo run
 
 ![image](https://github.com/user-attachments/assets/f6b97d89-61c4-438d-ade8-916d2e74df65)
