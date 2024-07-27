@@ -36,14 +36,14 @@ fn cli(username: String) {
                 stdout().flush().unwrap();
                 get_chat();
             }
-            _ => {}
+            _ => {
+                // decorate and send message to server
+                let buf = add_username(buf, &username);
+                let buf = buf.as_str();
+                let mut stream = TcpStream::connect("3.25.92.165:8080").unwrap();
+                stream.write(buf.as_bytes()).unwrap();
+            }
         }
-
-        // decorate and send message to server
-        let buf = add_username(buf, &username);
-        let buf = buf.as_str();
-        let mut stream = TcpStream::connect("0.0.0.0:8080").unwrap();
-        stream.write(buf.as_bytes()).unwrap();
     }
 }
 
@@ -60,10 +60,10 @@ fn add_username(buf: String, username: &String) -> String {
 
 fn get_chat() -> String {
 
-    // just send over a zero byte to trigger the server response
+    // send over the $get command.
     let mut get_command = String::new();
     get_command.push_str("$get\n");
-    let mut stream = TcpStream::connect("0.0.0.0:8080").unwrap();
+    let mut stream = TcpStream::connect("3.25.92.165:8080").unwrap();
     stream.write(get_command.as_bytes()).unwrap();
 
     // reveice the chat from server
@@ -72,10 +72,14 @@ fn get_chat() -> String {
 
     let received = String::from_utf8_lossy(&received);
     let received = received.trim_matches(char::from(0));
-    let value = String::from_str(received);
-    println!("{value:#?}");
+    let value = String::from_str(received).unwrap();
+    render(received);
     stdout().flush().unwrap();
-    value.unwrap()
+    value
 }
 
-
+fn render(chat: &str) {
+    for c in chat.chars() {
+        print!("{}", c)
+    }
+}
