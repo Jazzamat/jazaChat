@@ -2,7 +2,7 @@
 
 A basic TCP chat implemented in rust. 
 
-To run the client, cd into the dir and 'cargo run'. You need rust to run cargo run
+To run the client, cd into the dir and 'cargo run'. You need rust to run cargo run. I recently added asci art file so you are going to have to navigate to the src file of client and cargo run in there (until I figure out how to make cargo recognise relative file paths)
 
 ![image](https://github.com/user-attachments/assets/f6b97d89-61c4-438d-ade8-916d2e74df65)
 
