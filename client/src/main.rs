@@ -1,6 +1,7 @@
-use std::{io::{self, stdin, stdout, Read, Write}, net::TcpStream, str::FromStr};
+use std::{fs, io::{self, stdin, stdout, Read, Write}, net::TcpStream, str::FromStr};
 
 fn main() -> io::Result<()>{
+    renderAsciiTitle();
     let username = intro();
     cli(username);
     Ok(())
@@ -16,6 +17,17 @@ fn intro() -> String {
     stdin.read_line(&mut buf).unwrap();
     let username = buf.trim_matches('\n');
     String::from_str(username).unwrap()
+}
+
+
+fn renderAsciiTitle() {
+
+
+    let contents = fs::read_to_string("ascititle.txt").expect("could read find this file");
+    println!("{contents}")
+
+
+
 }
 
 
@@ -83,3 +95,5 @@ fn render(chat: &str) {
         print!("{}", c)
     }
 }
+
+
