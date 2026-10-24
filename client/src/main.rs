@@ -1,9 +1,14 @@
-mod discovery;
+mod addresses;
+mod clipboard;
 mod network;
+mod storage;
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEventKind,
+    },
     execute, queue,
     style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
@@ -23,13 +28,19 @@ impl Screen {
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let guard = Self;
-        execute!(io::stdout(), EnterAlternateScreen, Hide)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
         Ok(guard)
     }
 }
 impl Drop for Screen {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), Show, ResetColor, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            Show,
+            ResetColor,
+            LeaveAlternateScreen
+        );
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -68,42 +79,107 @@ fn put(
     queue!(out, MoveTo(x, y), SetForegroundColor(color), Print(clipped))
 }
 
+struct InviteHit {
+    row: u16,
+    start: u16,
+    end: u16,
+    address: String,
+}
+fn clicked_invite(hits: &[InviteHit], column: u16, row: u16) -> Option<&str> {
+    hits.iter()
+        .find(|hit| hit.row == row && column >= hit.start && column < hit.end)
+        .map(|hit| hit.address.as_str())
+}
+fn request_copy(clipboard: &clipboard::Clipboard, address: Option<&str>) -> String {
+    match address {
+        Some(address) => match clipboard.copy(address) {
+            Ok(()) => "Copying invitation…".into(),
+            Err(error) => error.to_string(),
+        },
+        None => "No invitation visible; use /invite first.".into(),
+    }
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.iter().any(|s| s == "--help" || s == "-h") {
-        println!("jazaChat [username] [--listen IP:port] [--peer host:port]... [--no-discovery]\nDefaults: system username, automatic LAN discovery, available TCP port.\nUse --no-discovery to connect manually. /connect host:port adds a peer.\nEnter sends · PageUp/PageDown scroll · F2 toggles sound · Esc or Ctrl+C quits");
+        println!("jazaChat [username] [options]\n\nDirect encrypted P2P only. No servers or relays.\n  --listen IP:port       Single listener override (default IPv4 + IPv6 on port 45874)\n  --peer INVITATION      Join a peer using /ip4/.../tcp/.../p2p/... (repeatable)\n  --advertise ADDRESS    Public /ip4/.../tcp/... or /ip6/.../tcp/... (repeatable)\n  --upnp                 Ask your router to map the listening port\n  --no-discovery         Disable automatic LAN discovery\n  --no-peer-exchange     Only connect to invited, saved or LAN peers\n  --data-dir PATH        Store identity and contacts here\n  --ephemeral            Use a temporary identity; do not save contacts\n\nDefault name: system username. Saved contacts reconnect automatically.\nInternet joining needs a reachable invitation. NAT traversal is not guaranteed.\nIn chat: /invite shows public IPv6; /invite local shows LAN; /invite ipv4 shows public IPv4; /connect INVITATION adds a direct peer.\nClick an invite or press F3 to copy · Enter sends · PageUp/PageDown scroll · F2 toggles sound · Esc or Ctrl+C quits");
         return Ok(());
     }
-    let mut listen = "0.0.0.0:0".to_string();
+    let mut listen = "0.0.0.0:45874".to_string();
+    let mut explicit_listen = false;
     let mut auto_discovery = true;
+    let mut upnp = false;
+    let mut peer_exchange = true;
+    let mut ephemeral = false;
+    let mut advertise = Vec::new();
+    let mut data_dir = None;
     let mut peers = Vec::new();
     let mut name = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--no-discovery" => auto_discovery = false,
-            "--listen" | "--peer" => {
-                let value = args.next().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("{arg} requires an address"),
-                    )
-                })?;
-                if arg == "--listen" {
-                    listen = value.clone();
-                } else {
-                    peers.push(value.clone());
+            "--upnp" => upnp = true,
+            "--no-peer-exchange" => peer_exchange = false,
+            "--ephemeral" => ephemeral = true,
+            "--listen" | "--peer" | "--advertise" | "--data-dir" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| addresses::invalid(format!("{arg} requires a value")))?;
+                match arg.as_str() {
+                    "--listen" => {
+                        listen = value.clone();
+                        explicit_listen = true;
+                    }
+                    "--peer" => {
+                        addresses::invitation(value)?;
+                        peers.push(value.clone());
+                    }
+                    "--advertise" => {
+                        let address = value
+                            .parse()
+                            .map_err(|_| addresses::invalid("Invalid advertised multiaddress"))?;
+                        let (_, peer) = addresses::direct_address(&address)?;
+                        if peer.is_some() {
+                            return Err(addresses::invalid("--advertise must omit /p2p/PEER_ID"));
+                        }
+                        advertise.push(address);
+                    }
+                    _ => data_dir = Some(std::path::PathBuf::from(value)),
                 }
             }
             _ if !arg.starts_with('-') && name.is_none() => name = Some(arg.clone()),
             _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("Unknown argument: {arg}. See --help"),
-                ))
+                return Err(addresses::invalid(format!(
+                    "Unknown argument: {arg}. See --help"
+                )))
             }
         }
     }
+    if ephemeral && data_dir.is_some() {
+        return Err(addresses::invalid(
+            "Choose either --ephemeral or --data-dir",
+        ));
+    }
+    let data_dir = if ephemeral {
+        None
+    } else {
+        Some(
+            data_dir
+                .or_else(|| {
+                    env::var_os("XDG_DATA_HOME")
+                        .map(std::path::PathBuf::from)
+                        .map(|p| p.join("jazachat"))
+                })
+                .or_else(|| {
+                    env::var_os("HOME")
+                        .map(std::path::PathBuf::from)
+                        .map(|p| p.join(".local/share/jazachat"))
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from(".jazachat")),
+        )
+    };
     let username = name.unwrap_or_else(|| {
         env::var("USER")
             .or_else(|_| env::var("USERNAME"))
@@ -122,33 +198,47 @@ fn main() -> io::Result<()> {
             "A username is required",
         ));
     }
-    let (network, rx) = network::Network::bind(&listen)?;
+    let (network, rx) = network::Network::start(network::Config {
+        #[cfg(test)]
+        test_peers: None,
+        additional_listen: if explicit_listen {
+            None
+        } else {
+            Some("[::]:45874".parse().unwrap())
+        },
+        listen: listen.parse().map_err(|_| {
+            addresses::invalid("--listen requires an IP:port, e.g. 0.0.0.0:45874 or [::]:45874")
+        })?,
+        advertise,
+        discovery: auto_discovery,
+        upnp,
+        peer_exchange,
+        data_dir,
+    })?;
     for peer in peers {
-        network.connect(peer);
+        network.connect(peer)?;
     }
-    let discovery_error = if auto_discovery {
-        discovery::start(&network).err()
-    } else {
-        None
-    };
     let _screen = Screen::enter()?;
     let mut input = String::new();
     let mut cursor = 0usize;
     let mut history = VecDeque::new();
+    let clipboard = clipboard::Clipboard::new();
     let mut scroll = 0usize;
     let mut sound_enabled = true;
-    let mut status = match discovery_error {
-        Some(error) => format!("Auto-discovery unavailable: {error}"),
-        None if auto_discovery => "Finding people on your local network…".into(),
-        None => format!("Listening on {}", network.address),
-    };
+    let mut status = format!(
+        "Direct only · listening on {} · /invite to share",
+        network.address
+    );
     loop {
         let mut notify = false;
         while let Ok(message) = rx.try_recv() {
             match message {
                 network::Event::Message(message) => {
                     let own = message.sender == network.identity;
-                    notify |= sound_enabled && !own;
+                    let invite = addresses::invitation(message.text.trim())
+                        .ok()
+                        .map(|_| message.text.trim().to_string());
+                    notify |= sound_enabled && !own && !message.sender.is_empty();
                     if history.len() == 500 {
                         history.pop_front();
                     }
@@ -156,6 +246,7 @@ fn main() -> io::Result<()> {
                         clean(&message.timestamp),
                         format!("[{}] {}", clean(&message.username), clean(&message.text)),
                         own,
+                        invite,
                     ));
                 }
                 network::Event::Status(message) => status = clean(&message),
@@ -163,6 +254,17 @@ fn main() -> io::Result<()> {
         }
         let (w, h) = terminal::size()?;
         let mut out = io::stdout();
+        while let Ok(result) = clipboard.results.try_recv() {
+            match result {
+                clipboard::Outcome::Copied => status = "Invite copied to clipboard.".into(),
+                clipboard::Outcome::TerminalRequest(sequence) => {
+                    out.write_all(sequence.as_bytes())?;
+                    status =
+                        "Copy requested from terminal (clipboard permission may be needed).".into();
+                }
+            }
+        }
+        let mut invite_hits = Vec::new();
         // One terminal bell per incoming batch; local messages stay silent.
         if notify {
             queue!(out, Print("\x07"))?;
@@ -202,12 +304,23 @@ fn main() -> io::Result<()> {
                 width,
             )?;
             let mut rows = Vec::new();
-            for (date, msg, own) in &history {
-                rows.push((date.clone(), Color::DarkGrey));
-                for line in wrap(msg, width as usize) {
-                    rows.push((line, if *own { ACCENT } else { Color::White }));
+            for (date, msg, own, invite) in &history {
+                rows.push((date.clone(), Color::DarkGrey, None));
+                if let Some(address) = invite {
+                    rows.push((
+                        "Click invite to copy · F3 copies first visible invite".into(),
+                        Color::DarkGrey,
+                        None,
+                    ));
+                    for line in wrap(address, width as usize) {
+                        rows.push((line, ACCENT, Some(address.clone())));
+                    }
+                } else {
+                    for line in wrap(msg, width as usize) {
+                        rows.push((line, if *own { ACCENT } else { Color::White }, None));
+                    }
                 }
-                rows.push((String::new(), Color::White));
+                rows.push((String::new(), Color::White, None));
             }
             let available = (h - 10) as usize;
             scroll = scroll.min(rows.len().saturating_sub(available));
@@ -227,16 +340,28 @@ fn main() -> io::Result<()> {
                     2,
                     6,
                     if auto_discovery {
-                        "People on your network join automatically."
+                        "LAN peers join automatically. /invite to share."
                     } else {
-                        "Add a peer: /connect IP:port"
+                        "Join with /connect INVITATION"
                     },
                     Color::DarkGrey,
                     width,
                 )?;
             }
-            for (i, (line, color)) in rows[start..end].iter().enumerate() {
-                put(&mut out, 2, 4 + i as u16, line, *color, width)?;
+            for (i, (line, color, invite)) in rows[start..end].iter().enumerate() {
+                let row = 4 + i as u16;
+                put(&mut out, 2, row, line, *color, width)?;
+                if let Some(address) = invite {
+                    invite_hits.push(InviteHit {
+                        row,
+                        start: 2,
+                        end: 2 + line
+                            .chars()
+                            .map(|c| c.width().unwrap_or(0) as u16)
+                            .sum::<u16>(),
+                        address: address.clone(),
+                    });
+                }
             }
             put(
                 &mut out,
@@ -295,7 +420,7 @@ fn main() -> io::Result<()> {
                 &mut out,
                 2,
                 h - 2,
-                "Enter send · PgUp/PgDn scroll · Esc quit",
+                "Enter send · F3 copy invite · Esc quit",
                 Color::DarkGrey,
                 width,
             )?;
@@ -305,27 +430,56 @@ fn main() -> io::Result<()> {
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
-        if let Event::Key(key) = event::read()? {
+        let event = event::read()?;
+        if let Event::Mouse(mouse) = event {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(address) = clicked_invite(&invite_hits, mouse.column, mouse.row) {
+                        status = request_copy(&clipboard, Some(address));
+                    }
+                }
+                MouseEventKind::ScrollUp => scroll = scroll.saturating_add(3),
+                MouseEventKind::ScrollDown => scroll = scroll.saturating_sub(3),
+                _ => {}
+            }
+            continue;
+        }
+        if let Event::Key(key) = event {
             if key.kind == KeyEventKind::Release {
                 continue;
             }
             match key.code {
                 KeyCode::F(2) => sound_enabled = !sound_enabled,
+                KeyCode::F(3) => {
+                    status = request_copy(
+                        &clipboard,
+                        invite_hits.first().map(|hit| hit.address.as_str()),
+                    )
+                }
                 KeyCode::Esc => break,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                 KeyCode::Enter if !input.trim().is_empty() => {
-                    if let Some(address) = input.trim().strip_prefix("/connect ") {
-                        network.connect(address.trim().to_string());
-                    } else if network.count() == 0 {
-                        status = if auto_discovery {
-                            "Waiting for someone on your local network. Draft kept."
-                        } else {
-                            "No peers connected; use /connect IP:port. Draft kept."
+                    if matches!(input.trim(), "/invite" | "/invite local" | "/invite ipv4") {
+                        let kind = match input.trim() {
+                            "/invite local" => addresses::InviteKind::Local,
+                            "/invite ipv4" => addresses::InviteKind::Ipv4,
+                            _ => addresses::InviteKind::Ipv6,
+                        };
+                        if let Err(error) = network.show_invitations(kind) {
+                            status = error.to_string();
+                            continue;
                         }
-                        .into();
+                    } else if let Some(address) = input.trim().strip_prefix("/connect ") {
+                        if let Err(error) = network.connect(address.trim().to_string()) {
+                            status = error.to_string();
+                            continue;
+                        }
+                    } else if network.count() == 0 {
+                        status = "No direct peers yet. Use /connect INVITATION. Draft kept.".into();
                         continue;
-                    } else {
-                        network.send(&username, input.trim());
+                    } else if let Err(error) = network.send(&username, input.trim()) {
+                        status = error.to_string();
+                        continue;
                     }
                     input.clear();
                     cursor = 0;
@@ -369,6 +523,51 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invite_click_on_wrapped_row_copies_full_address() {
+        let address = format!(
+            "/ip6/2606:4700::1111/tcp/45874/p2p/{}",
+            libp2p::PeerId::random()
+        );
+        let hits = vec![
+            InviteHit {
+                row: 5,
+                start: 2,
+                end: 32,
+                address: address.clone(),
+            },
+            InviteHit {
+                row: 6,
+                start: 2,
+                end: 32,
+                address: address.clone(),
+            },
+        ];
+        assert_eq!(clicked_invite(&hits, 15, 6), Some(address.as_str()));
+        assert_eq!(clicked_invite(&hits, 2, 5), Some(address.as_str()));
+        assert_eq!(clicked_invite(&hits, 1, 6), None);
+        assert_eq!(clicked_invite(&hits, 32, 6), None);
+        assert_eq!(clicked_invite(&hits, 15, 7), None);
+    }
+    #[test]
+    fn invite_click_selects_correct_visible_invitation() {
+        let hits = vec![
+            InviteHit {
+                row: 5,
+                start: 2,
+                end: 30,
+                address: "first invitation".into(),
+            },
+            InviteHit {
+                row: 8,
+                start: 2,
+                end: 30,
+                address: "second invitation".into(),
+            },
+        ];
+        assert_eq!(clicked_invite(&hits, 5, 8), Some("second invitation"));
+        assert_eq!(clicked_invite(&[], 5, 8), None);
+    }
     #[test]
     fn wraps_wide_unicode_without_splitting_utf8() {
         assert_eq!(wrap("a界bc", 3), vec!["a界", "bc"]);
