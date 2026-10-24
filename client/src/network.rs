@@ -47,6 +47,7 @@ impl Seen {
 pub struct Network {
     peers: Peers,
     outgoing: mpsc::Sender<Outgoing>,
+    pub(crate) discovered: Mutex<HashSet<String>>,
     seen: Mutex<Seen>,
     next: AtomicU64,
     pub identity: String,
@@ -61,6 +62,7 @@ impl Network {
         let network = Arc::new(Self {
             address: listener.local_addr()?,
             outgoing,
+            discovered: Mutex::new(HashSet::new()),
             peers: Mutex::new(HashMap::new()),
             seen: Mutex::new(Seen::default()),
             next: AtomicU64::new(1),
@@ -97,9 +99,11 @@ impl Network {
             };
             match listener.accept() {
                 Ok((stream, _)) => {
-                    if let Err(e) = network.attach(stream) {
-                        network.status(format!("Connection failed: {e}"));
-                    }
+                    thread::spawn(move || {
+                        if let Err(e) = network.attach(stream) {
+                            network.status(format!("Connection failed: {e}"));
+                        }
+                    });
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     drop(network);
@@ -136,7 +140,35 @@ impl Network {
             }
         });
     }
+    pub(crate) fn connect_discovered(self: &Arc<Self>, identity: String, address: SocketAddr) {
+        // Only one end dials, and advertisements cannot create repeated connections.
+        if identity <= self.identity {
+            return;
+        }
+        {
+            let mut discovered = self.discovered.lock().unwrap();
+            if discovered.len() >= 128 || !discovered.insert(identity.clone()) {
+                return;
+            }
+        }
+        let network = Arc::clone(self);
+        thread::spawn(move || {
+            let result = TcpStream::connect_timeout(&address, Duration::from_secs(2))
+                .and_then(|stream| network.attach_discovered(stream, Some(identity.clone())));
+            if result.is_err() {
+                // The next advertisement retries a failed connection.
+                network.discovered.lock().unwrap().remove(&identity);
+            }
+        });
+    }
     fn attach(self: &Arc<Self>, stream: TcpStream) -> io::Result<()> {
+        self.attach_discovered(stream, None)
+    }
+    fn attach_discovered(
+        self: &Arc<Self>,
+        stream: TcpStream,
+        discovered_id: Option<String>,
+    ) -> io::Result<()> {
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         stream.set_nodelay(true)?;
         let address = stream.peer_addr()?;
@@ -158,9 +190,23 @@ impl Network {
                 }
             }
             network.peers.lock().unwrap().remove(&id);
+            if let Some(identity) = discovered_id {
+                network.discovered.lock().unwrap().remove(&identity);
+            }
             network.status(format!("Disconnected from {address}"));
         });
         Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn disconnect_all_for_test(&self) {
+        for peer in self.peers.lock().unwrap().values() {
+            let _ = peer.lock().unwrap().shutdown(std::net::Shutdown::Both);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while self.count() != 0 {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
     }
     pub fn count(&self) -> usize {
         self.peers.lock().unwrap().len()

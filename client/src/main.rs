@@ -1,3 +1,4 @@
+mod discovery;
 mod network;
 
 use crossterm::{
@@ -70,15 +71,17 @@ fn put(
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.iter().any(|s| s == "--help" || s == "-h") {
-        println!("jazaChat [username] [--listen IP:port] [--peer host:port]...\nDefault listener: 0.0.0.0:8080. No server needed.\nConnect each pair once for group chat. /connect host:port adds a peer.\nEnter sends · PageUp/PageDown scroll · F2 toggles sound · Esc or Ctrl+C quits");
+        println!("jazaChat [username] [--listen IP:port] [--peer host:port]... [--no-discovery]\nDefaults: system username, automatic LAN discovery, available TCP port.\nUse --no-discovery to connect manually. /connect host:port adds a peer.\nEnter sends · PageUp/PageDown scroll · F2 toggles sound · Esc or Ctrl+C quits");
         return Ok(());
     }
-    let mut listen = "0.0.0.0:8080".to_string();
+    let mut listen = "0.0.0.0:0".to_string();
+    let mut auto_discovery = true;
     let mut peers = Vec::new();
     let mut name = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--no-discovery" => auto_discovery = false,
             "--listen" | "--peer" => {
                 let value = args.next().ok_or_else(|| {
                     io::Error::new(
@@ -101,15 +104,13 @@ fn main() -> io::Result<()> {
             }
         }
     }
-    let username = if let Some(name) = name {
-        name
-    } else {
-        print!("Welcome to jazaChat\nChoose a username: ");
-        io::stdout().flush()?;
-        let mut name = String::new();
-        io::stdin().read_line(&mut name)?;
-        name
-    };
+    let username = name.unwrap_or_else(|| {
+        env::var("USER")
+            .or_else(|_| env::var("USERNAME"))
+            .ok()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| format!("guest-{}", std::process::id()))
+    });
     let username: String = clean(username.trim())
         .chars()
         .filter(|c| *c != '[' && *c != ']')
@@ -125,13 +126,22 @@ fn main() -> io::Result<()> {
     for peer in peers {
         network.connect(peer);
     }
+    let discovery_error = if auto_discovery {
+        discovery::start(&network).err()
+    } else {
+        None
+    };
     let _screen = Screen::enter()?;
     let mut input = String::new();
     let mut cursor = 0usize;
     let mut history = VecDeque::new();
     let mut scroll = 0usize;
     let mut sound_enabled = true;
-    let mut status = format!("Listening on {}", network.address);
+    let mut status = match discovery_error {
+        Some(error) => format!("Auto-discovery unavailable: {error}"),
+        None if auto_discovery => "Finding people on your local network…".into(),
+        None => format!("Listening on {}", network.address),
+    };
     loop {
         let mut notify = false;
         while let Ok(message) = rx.try_recv() {
@@ -216,7 +226,11 @@ fn main() -> io::Result<()> {
                     &mut out,
                     2,
                     6,
-                    "Add a peer: /connect IP:port",
+                    if auto_discovery {
+                        "People on your network join automatically."
+                    } else {
+                        "Add a peer: /connect IP:port"
+                    },
                     Color::DarkGrey,
                     width,
                 )?;
@@ -303,7 +317,12 @@ fn main() -> io::Result<()> {
                     if let Some(address) = input.trim().strip_prefix("/connect ") {
                         network.connect(address.trim().to_string());
                     } else if network.count() == 0 {
-                        status = "No peers connected; use /connect IP:port. Draft kept.".into();
+                        status = if auto_discovery {
+                            "Waiting for someone on your local network. Draft kept."
+                        } else {
+                            "No peers connected; use /connect IP:port. Draft kept."
+                        }
+                        .into();
                         continue;
                     } else {
                         network.send(&username, input.trim());
