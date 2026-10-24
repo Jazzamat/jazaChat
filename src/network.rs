@@ -46,6 +46,7 @@ pub struct Config {
 }
 #[derive(Clone, Debug)]
 pub struct Message {
+    pub id: String,
     pub sender: String,
     pub username: String,
     pub timestamp: String,
@@ -54,6 +55,8 @@ pub struct Message {
 pub enum Event {
     Message(Message),
     Status(String),
+    Notice(String),
+    Delivery { id: String, text: String },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Chat {
@@ -92,6 +95,7 @@ enum Command {
     Connect(Multiaddr, PeerId),
     Send(String, String),
     Invitations(InviteKind),
+    Peers,
     #[cfg(test)]
     Disconnect,
 }
@@ -169,6 +173,9 @@ impl Network {
     pub fn show_invitations(&self, kind: InviteKind) -> io::Result<()> {
         self.command(Command::Invitations(kind))
     }
+    pub fn show_peers(&self) -> io::Result<()> {
+        self.command(Command::Peers)
+    }
     pub fn connect(&self, value: String) -> io::Result<()> {
         let (address, peer) = invitation(value.trim())?;
         self.command(Command::Connect(address, peer))
@@ -191,6 +198,21 @@ struct Contact {
     retry_at: Instant,
     failures: u32,
 }
+#[derive(Default)]
+struct Receipt {
+    total: usize,
+    accepted: usize,
+    failed: usize,
+}
+impl Receipt {
+    fn summary(&self) -> String {
+        let pending = self.total - self.accepted - self.failed;
+        format!(
+            "Received by {}/{} peers · {} pending · {} failed",
+            self.accepted, self.total, pending, self.failed
+        )
+    }
+}
 struct Worker {
     swarm: Swarm<Behaviour>,
     contacts: HashMap<PeerId, Contact>,
@@ -200,10 +222,42 @@ struct Worker {
     config: Config,
     seen: HashSet<(PeerId, String)>,
     seen_order: VecDeque<(PeerId, String)>,
+    pending_messages: HashMap<request_response::OutboundRequestId, String>,
+    receipts: HashMap<String, Receipt>,
     counter: u64,
     session: String,
 }
 impl Worker {
+    fn notice(&self, text: impl Into<String>) {
+        let _ = self.tx.send(Event::Notice(text.into()));
+    }
+    fn finish_delivery(
+        &mut self,
+        request: request_response::OutboundRequestId,
+        failure: Option<String>,
+    ) {
+        let Some(id) = self.pending_messages.remove(&request) else {
+            return;
+        };
+        if let Some(receipt) = self.receipts.get_mut(&id) {
+            if failure.is_some() {
+                receipt.failed += 1;
+            } else {
+                receipt.accepted += 1;
+            }
+            let _ = self.tx.send(Event::Delivery {
+                id: id.clone(),
+                text: receipt.summary(),
+            });
+            if receipt.accepted + receipt.failed == receipt.total {
+                self.receipts.remove(&id);
+            }
+        }
+        if let Some(error) = failure {
+            self.notice(format!("Delivery failed: {error}"));
+        }
+    }
+
     fn status(&self, text: impl Into<String>) {
         let _ = self.tx.send(Event::Status(text.into()));
     }
@@ -307,24 +361,44 @@ impl Worker {
         {
             return false;
         }
-        let id = (peer, chat.id);
+        let id = (peer, chat.id.clone());
         if self.seen.insert(id.clone()) {
             self.seen_order.push_back(id);
             if self.seen_order.len() > 4096 {
                 self.seen.remove(&self.seen_order.pop_front().unwrap());
             }
             // Sender comes from the authenticated transport, never the message body.
-            let _ = self.tx.send(Event::Message(Message {
-                sender: peer.to_string(),
-                username: chat.username,
-                timestamp: chat.timestamp,
-                text: chat.text,
-            }));
+            return self
+                .tx
+                .send(Event::Message(Message {
+                    id: chat.id,
+                    sender: peer.to_string(),
+                    username: chat.username,
+                    timestamp: chat.timestamp,
+                    text: chat.text,
+                }))
+                .is_ok();
         }
         true
     }
     fn command(&mut self, command: Command) {
         match command {
+            Command::Peers => {
+                self.notice(format!("This app: {}", self.swarm.local_peer_id()));
+                let peers: Vec<_> = self.swarm.connected_peers().copied().collect();
+                if peers.is_empty() {
+                    self.notice("No connected peers.");
+                }
+                for peer in peers {
+                    self.notice(format!(
+                        "Connected peer: {peer} · address {}",
+                        self.remote_ips
+                            .get(&peer)
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "unknown".into())
+                    ));
+                }
+            }
             Command::Connect(address, peer) => {
                 self.remember(peer, address, false);
                 if let Some(contact) = self.contacts.get_mut(&peer) {
@@ -362,6 +436,7 @@ impl Worker {
                 };
                 for text in std::iter::once(note.to_string()).chain(invitations) {
                     let _ = self.tx.send(Event::Message(Message {
+                        id: String::new(),
                         sender: String::new(),
                         username: "invite".into(),
                         timestamp: String::new(),
@@ -373,7 +448,7 @@ impl Worker {
             Command::Send(username, text) => {
                 let peers: Vec<_> = self.swarm.connected_peers().copied().collect();
                 if peers.is_empty() {
-                    self.status("No direct peers connected; message was not sent.");
+                    self.notice("No direct peers connected; message was not sent.");
                     return;
                 }
                 self.counter += 1;
@@ -385,12 +460,23 @@ impl Worker {
                     text,
                 };
                 self.receive_chat(*self.swarm.local_peer_id(), chat.clone());
+                let receipt = Receipt {
+                    total: peers.len(),
+                    ..Receipt::default()
+                };
+                let _ = self.tx.send(Event::Delivery {
+                    id: chat.id.clone(),
+                    text: receipt.summary(),
+                });
+                self.receipts.insert(chat.id.clone(), receipt);
                 // Only locally composed messages are sent. Received messages are NEVER forwarded.
                 for peer in peers {
-                    self.swarm
+                    let request = self
+                        .swarm
                         .behaviour_mut()
                         .chat
                         .send_request(&peer, Request::Chat(chat.clone()));
+                    self.pending_messages.insert(request, chat.id.clone());
                 }
             }
             #[cfg(test)]
@@ -457,6 +543,7 @@ impl Worker {
                 ..
             })) => {
                 if info.protocol_version != PROTOCOL {
+                    self.notice(format!("Peer {peer_id} uses incompatible protocol {}. Update and restart both apps.", info.protocol_version));
                     let _ = self.swarm.disconnect_peer_id(peer_id);
                     return;
                 }
@@ -522,17 +609,35 @@ impl Worker {
                     }
                 }
                 request_response::Message::Response {
+                    request_id,
+                    response: Response::Accepted,
+                } => self.finish_delivery(request_id, None),
+                request_response::Message::Response {
+                    request_id,
                     response: Response::Rejected,
-                    ..
-                } => self.status(format!("Message rejected by {peer}")),
-                _ => {}
+                } => self.finish_delivery(
+                    request_id,
+                    Some(format!("peer {peer} rejected the message")),
+                ),
             },
             SwarmEvent::Behaviour(BehaviourEvent::Chat(
-                request_response::Event::OutboundFailure { peer, error, .. },
+                request_response::Event::OutboundFailure {
+                    peer,
+                    request_id,
+                    error,
+                    ..
+                },
             )) => {
-                self.status(format!(
-                    "Direct request to {peer} failed: {error}; delivery is not confirmed"
-                ));
+                if self.pending_messages.contains_key(&request_id) {
+                    self.finish_delivery(request_id, Some(format!("peer {peer}: {error}")));
+                } else {
+                    self.status(format!("Peer discovery request to {peer} failed: {error}"));
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Chat(
+                request_response::Event::InboundFailure { peer, error, .. },
+            )) => {
+                self.notice(format!("Could not receive a request from {peer}: {error}. Check both apps are up to date."));
             }
             SwarmEvent::Behaviour(BehaviourEvent::Upnp(upnp::Event::NewExternalAddr(address))) => {
                 self.swarm.add_external_address(address.clone());
@@ -680,6 +785,8 @@ async fn run(
         config,
         seen: HashSet::new(),
         seen_order: VecDeque::new(),
+        pending_messages: HashMap::new(),
+        receipts: HashMap::new(),
         counter: 0,
         session: PeerId::random().to_string(),
     };
@@ -753,14 +860,95 @@ mod tests {
     fn message(rx: &mpsc::Receiver<Event>) -> Message {
         let end = Instant::now() + Duration::from_secs(10);
         loop {
-            match rx
+            if let Event::Message(message) = rx
                 .recv_timeout(end.saturating_duration_since(Instant::now()))
                 .unwrap()
             {
-                Event::Message(m) => return m,
-                Event::Status(_) => {}
+                return message;
             }
         }
+    }
+    #[test]
+    fn sender_marks_received_only_after_remote_acknowledges() {
+        let (a, arx) = start(false);
+        let (b, brx) = start(false);
+        a.connect(invite(&b)).unwrap();
+        wait_counts(&[(&a, 1), (&b, 1)]);
+        a.send("alice", "acknowledge this").unwrap();
+        let local = message(&arx);
+        let remote = message(&brx);
+        assert_eq!(local.id, remote.id);
+        assert_eq!(remote.text, "acknowledge this");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut pending_seen = false;
+        loop {
+            if let Event::Delivery { id, text } = arx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
+                assert_eq!(id, local.id);
+                if text.contains("0/1 peers") {
+                    pending_seen = true;
+                }
+                if text.contains("1/1 peers") {
+                    assert!(pending_seen);
+                    break;
+                }
+            }
+        }
+    }
+    #[test]
+    fn incompatible_chat_protocol_reports_delivery_failure_after_handshake() {
+        let (ready, address) = mpsc::channel();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let server = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let mut swarm = SwarmBuilder::with_new_identity().with_tokio()
+                    .with_tcp(libp2p::tcp::Config::default(), noise::Config::new, yamux::Config::default).unwrap()
+                    .with_behaviour(|_| ping::Behaviour::default()).unwrap()
+                    .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30))).build();
+                swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+                loop {
+                    tokio::select! {
+                        _ = &mut stopped => break,
+                        event = swarm.select_next_some() => if let SwarmEvent::NewListenAddr { address, .. } = event {
+                            ready.send(format!("{address}/p2p/{}", swarm.local_peer_id())).unwrap();
+                        }
+                    }
+                }
+            });
+        });
+        let (a, arx) = start(false);
+        a.connect(address.recv_timeout(Duration::from_secs(5)).unwrap())
+            .unwrap();
+        wait_counts(&[(&a, 1)]);
+        a.send("alice", "cannot be delivered").unwrap();
+        let local = message(&arx);
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut failed = false;
+        let mut explained = false;
+        while !failed || !explained {
+            match arx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
+                Event::Delivery { id, text } => {
+                    assert_eq!(id, local.id);
+                    assert!(!text.contains("Received by 1/1"));
+                    if text.contains("1 failed") {
+                        failed = true;
+                    }
+                }
+                Event::Notice(text) if text.contains("Delivery failed") => explained = true,
+                _ => {}
+            }
+        }
+        stop.send(()).unwrap();
+        server.join().unwrap();
     }
     #[test]
     fn invite_reports_missing_public_ipv6_and_keeps_local_invites_explicit() {

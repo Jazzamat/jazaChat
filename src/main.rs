@@ -103,7 +103,7 @@ fn request_copy(clipboard: &clipboard::Clipboard, address: Option<&str>) -> Stri
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.iter().any(|s| s == "--help" || s == "-h") {
-        println!("jazaChat [username] [options]\n\nDirect encrypted P2P only. No servers or relays.\n  --listen IP:port       Single listener override (default IPv4 + IPv6 on port 45874)\n  --peer INVITATION      Join a peer using /ip4/.../tcp/.../p2p/... (repeatable)\n  --advertise ADDRESS    Public /ip4/.../tcp/... or /ip6/.../tcp/... (repeatable)\n  --upnp                 Ask your router to map the listening port\n  --no-discovery         Disable automatic LAN discovery\n  --no-peer-exchange     Only connect to invited, saved or LAN peers\n  --data-dir PATH        Store identity and contacts here\n  --ephemeral            Use a temporary identity; do not save contacts\n\nDefault name: system username. Saved contacts reconnect automatically.\nInternet joining needs a reachable invitation. NAT traversal is not guaranteed.\nIn chat: /invite shows public IPv6; /invite local shows LAN; /invite ipv4 shows public IPv4; /connect INVITATION adds a direct peer.\nClick an invite or press F3 to copy · Enter sends · PageUp/PageDown scroll · F2 toggles sound · Esc or Ctrl+C quits");
+        println!("jazaChat [username] [options]\n\nDirect encrypted P2P only. No servers or relays.\n  --listen IP:port       Single listener override (default IPv4 + IPv6 on port 45874)\n  --peer INVITATION      Join a peer using /ip4/.../tcp/.../p2p/... (repeatable)\n  --advertise ADDRESS    Public /ip4/.../tcp/... or /ip6/.../tcp/... (repeatable)\n  --upnp                 Ask your router to map the listening port\n  --no-discovery         Disable automatic LAN discovery\n  --no-peer-exchange     Only connect to invited, saved or LAN peers\n  --data-dir PATH        Store identity and contacts here\n  --ephemeral            Use a temporary identity; do not save contacts\n\nDefault name: system username. Saved contacts reconnect automatically.\nInternet joining needs a reachable invitation. NAT traversal is not guaranteed.\nIn chat: /invite shows public IPv6; /invite local shows LAN; /invite ipv4 shows public IPv4; /connect INVITATION adds a direct peer; /peers lists connections.\nClick an invite or press F3 to copy · Enter sends · PageUp/PageDown scroll · F2 toggles sound · Esc or Ctrl+C quits");
         return Ok(());
     }
     let mut listen = "0.0.0.0:45874".to_string();
@@ -224,6 +224,7 @@ fn main() -> io::Result<()> {
     let mut history = VecDeque::new();
     let clipboard = clipboard::Clipboard::new();
     let mut scroll = 0usize;
+    let mut unread = 0usize;
     let mut sound_enabled = true;
     let mut status = format!(
         "Direct only · listening on {} · /invite to share",
@@ -239,6 +240,9 @@ fn main() -> io::Result<()> {
                         .ok()
                         .map(|_| message.text.trim().to_string());
                     notify |= sound_enabled && !own && !message.sender.is_empty();
+                    if !own && !message.sender.is_empty() && scroll > 0 {
+                        unread += 1;
+                    }
                     if history.len() == 500 {
                         history.pop_front();
                     }
@@ -247,9 +251,29 @@ fn main() -> io::Result<()> {
                         format!("[{}] {}", clean(&message.username), clean(&message.text)),
                         own,
                         invite,
+                        message.id,
+                        None::<String>,
                     ));
                 }
                 network::Event::Status(message) => status = clean(&message),
+                network::Event::Notice(message) => {
+                    if history.len() == 500 {
+                        history.pop_front();
+                    }
+                    history.push_back((
+                        String::new(),
+                        format!("[system] {}", clean(&message)),
+                        false,
+                        None,
+                        String::new(),
+                        None,
+                    ));
+                }
+                network::Event::Delivery { id, text } => {
+                    if let Some(entry) = history.iter_mut().find(|entry| entry.4 == id) {
+                        entry.5 = Some(text);
+                    }
+                }
             }
         }
         let (w, h) = terminal::size()?;
@@ -304,7 +328,7 @@ fn main() -> io::Result<()> {
                 width,
             )?;
             let mut rows = Vec::new();
-            for (date, msg, own, invite) in &history {
+            for (date, msg, own, invite, _, delivery) in &history {
                 rows.push((date.clone(), Color::DarkGrey, None));
                 if let Some(address) = invite {
                     rows.push((
@@ -320,10 +344,18 @@ fn main() -> io::Result<()> {
                         rows.push((line, if *own { ACCENT } else { Color::White }, None));
                     }
                 }
+                if let Some(delivery) = delivery {
+                    for line in wrap(delivery, width as usize) {
+                        rows.push((line, Color::DarkGrey, None));
+                    }
+                }
                 rows.push((String::new(), Color::White, None));
             }
             let available = (h - 10) as usize;
             scroll = scroll.min(rows.len().saturating_sub(available));
+            if scroll == 0 {
+                unread = 0;
+            }
             let end = rows.len().saturating_sub(scroll);
             let start = end.saturating_sub(available);
             if history.is_empty() {
@@ -420,7 +452,11 @@ fn main() -> io::Result<()> {
                 &mut out,
                 2,
                 h - 2,
-                "Enter send · F3 copy invite · Esc quit",
+                &if unread > 0 {
+                    format!("{unread} new messages · Ctrl+End to view latest")
+                } else {
+                    "Enter send · F3 copy invite · Esc quit".into()
+                },
                 Color::DarkGrey,
                 width,
             )?;
@@ -469,6 +505,11 @@ fn main() -> io::Result<()> {
                             status = error.to_string();
                             continue;
                         }
+                    } else if input.trim() == "/peers" {
+                        if let Err(error) = network.show_peers() {
+                            status = error.to_string();
+                            continue;
+                        }
                     } else if let Some(address) = input.trim().strip_prefix("/connect ") {
                         if let Err(error) = network.connect(address.trim().to_string()) {
                             status = error.to_string();
@@ -510,6 +551,10 @@ fn main() -> io::Result<()> {
                     cursor += input[cursor..].chars().next().unwrap().len_utf8()
                 }
                 KeyCode::Home => cursor = 0,
+                KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    scroll = 0;
+                    unread = 0;
+                }
                 KeyCode::End => cursor = input.len(),
                 KeyCode::PageUp => scroll = scroll.saturating_add(5),
                 KeyCode::PageDown => scroll = scroll.saturating_sub(5),
